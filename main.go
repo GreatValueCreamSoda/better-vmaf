@@ -7,11 +7,175 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
-	"strconv"
 	"strings"
 
 	"github.com/spf13/pflag"
 )
+
+type ComputeVmaf struct {
+	ReferencePath, DistortionPath string
+	CompareChroma, VmafMotion     bool
+	VmafSubsampling, ChromaWeight int
+}
+
+type VmafScoreResult struct {
+	FinalScore                      float64
+	Mean, GeoMean, Min, Max, StdDev [3]float64
+}
+
+func (cf *ComputeVmaf) Run() (VmafScoreResult, error) {
+	logFiles, err := cf.prepareLogFiles()
+	if err != nil {
+		return VmafScoreResult{}, err
+	}
+	defer cf.cleanupLogFiles(logFiles)
+
+	filter := cf.buildFilterGraph(logFiles)
+	if err := cf.executeFFmpeg(filter); err != nil {
+		return VmafScoreResult{}, err
+	}
+
+	scores, err := cf.parseScores(logFiles)
+	if err != nil {
+		return VmafScoreResult{}, err
+	}
+
+	return cf.calculateFinalScores(scores), nil
+}
+
+func (cf *ComputeVmaf) executeFFmpeg(filter string) error {
+	cmd := exec.Command(
+		"ffmpeg", "-r", "1", "-i", cf.DistortionPath, "-r", "1", "-i", cf.ReferencePath,
+		"-filter_complex", filter, "-f", "null", "-",
+	)
+	return cmd.Run()
+}
+
+func (cf *ComputeVmaf) prepareLogFiles() ([]string, error) {
+	numFiles := map[bool]int{true: 3, false: 1}[cf.CompareChroma]
+	logFiles := make([]string, 0, numFiles)
+	for i := 0; i < numFiles; i++ {
+		file, err := os.CreateTemp("", "vmaf_log_*.json")
+		if err != nil {
+			return nil, fmt.Errorf("failed to create temporary file: %w", err)
+		}
+		defer file.Close()
+		logFiles = append(logFiles, cf.toUnixPath(file.Name()))
+	}
+	return logFiles, nil
+}
+
+func (cf *ComputeVmaf) buildFilterGraph(logFiles []string) string {
+	var filter strings.Builder
+	filter.WriteString("[0:v:0]scale=1920:1080,format=yuv420p[dis];[1:v:0]scale=1920:1080,format=yuv420p[ref];")
+
+	if cf.CompareChroma {
+		filter.WriteString("[dis]extractplanes=y+u+v[dis_0][dis_1][dis_2];[ref]extractplanes=y+u+v[ref_0][ref_1][ref_2];")
+		for i := 0; i < 3; i++ {
+			filter.WriteString(fmt.Sprintf("[dis_%d][ref_%d]libvmaf=%s;", i, i, cf.filterParams(logFiles[i])))
+		}
+	} else {
+		filter.WriteString("[dis][ref]libvmaf=" + cf.filterParams(logFiles[0]))
+	}
+	return filter.String()
+}
+
+func (cf *ComputeVmaf) filterParams(logPath string) string {
+	threads := runtime.NumCPU()
+	if cf.CompareChroma {
+		threads = threads/3 + 2
+	}
+	return fmt.Sprintf(
+		"n_threads=%d:model=version=vmaf_v0.6.1\\\\:motion.motion_force_zero=%v:log_fmt=json:log_path=%s",
+		threads, !cf.VmafMotion, logPath,
+	)
+}
+
+func (cf *ComputeVmaf) parseScores(logFiles []string) ([][]float64, error) {
+	scores := make([][]float64, len(logFiles))
+	for i, logFile := range logFiles {
+		parsed, err := cf.parseLogFile(logFile)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing log file: %w", err)
+		}
+		scores[i] = parsed
+	}
+	return scores, nil
+}
+
+func (*ComputeVmaf) parseLogFile(logFile string) ([]float64, error) {
+	var log struct {
+		Frames []struct {
+			Metrics struct {
+				Vmaf float64 `json:"vmaf"`
+			} `json:"metrics"`
+		} `json:"frames"`
+	}
+	data, err := os.ReadFile(logFile)
+	if err != nil {
+		return nil, fmt.Errorf("error reading file: %w", err)
+	}
+	if err := json.Unmarshal(data, &log); err != nil {
+		return nil, fmt.Errorf("error unmarshalling JSON: %w", err)
+	}
+	scores := make([]float64, len(log.Frames))
+	for i, frame := range log.Frames {
+		scores[i] = frame.Metrics.Vmaf
+	}
+	return scores, nil
+}
+
+func (cf *ComputeVmaf) calculateFinalScores(scores [][]float64) VmafScoreResult {
+	var geoScores []float64
+	var res VmafScoreResult
+	for i, score := range scores {
+		res.Mean[i], res.GeoMean[i], res.Min[i], res.Max[i], res.StdDev[i] = cf.stats(score)
+		geoScores = append(geoScores, res.GeoMean[i])
+	}
+	if cf.CompareChroma {
+		weight := float64(cf.ChromaWeight)
+		res.FinalScore = (geoScores[0]*weight + geoScores[1] + geoScores[2]) / (weight + 2)
+	} else {
+		res.FinalScore = geoScores[0]
+	}
+	return res
+}
+
+func (*ComputeVmaf) stats(nums []float64) (float64, float64, float64, float64, float64) {
+	if len(nums) == 0 {
+		return 0, 0, 0, 0, 0
+	}
+	sum, logSum, min, max := 0.0, 0.0, nums[0], nums[0]
+	for _, num := range nums {
+		sum += num
+		logSum += math.Log(num)
+		if num < min {
+			min = num
+		}
+		if num > max {
+			max = num
+		}
+	}
+	mean := sum / float64(len(nums))
+	geomMean := math.Exp(logSum / float64(len(nums)))
+	varianceSum := 0.0
+	for _, num := range nums {
+		diff := num - mean
+		varianceSum += diff * diff
+	}
+	stdDev := math.Sqrt(varianceSum / float64(len(nums)))
+	return mean, geomMean, min, max, stdDev
+}
+
+func (*ComputeVmaf) cleanupLogFiles(logFiles []string) {
+	for _, file := range logFiles {
+		_ = os.Remove(file)
+	}
+}
+
+func (*ComputeVmaf) toUnixPath(path string) string {
+	return strings.ReplaceAll(strings.Split(path, ":")[1], "\\", "/")
+}
 
 var (
 	reference, distortion string
@@ -23,237 +187,42 @@ var (
 )
 
 func init() {
-	pflag.StringVarP(&reference, "reference", "r", "", "reference video file for vmaf comaprison")
-	pflag.StringVarP(&distortion, "distortion", "d", "", "distorted video file for vmaf comaprison")
-	pflag.IntVar(&vmafSubsampling, "vmaf-subsampling", 1, "only calculate every X frame for faster comparisions")
-	pflag.BoolVar(&compareChromaNeg, "no-compare-chroma", false, "compute vmaf scores without chroma channels (standalone vmaf defaults to this)")
-	pflag.IntVar(&chromaWeight, "chroma-weight", 4, "sets the chroma weight relative to luma channels where weight is 1/chroma-weight")
-	pflag.BoolVar(&vmafMotion, "vmaf-motion", false, "set whether or not to calculate vmaf using vmafs temporal component. Not recomended for high quality targets")
+	pflag.StringVarP(&reference, "reference", "r", "", "reference video file for VMAF comparison")
+	pflag.StringVarP(&distortion, "distortion", "d", "", "distorted video file for VMAF comparison")
+	pflag.IntVar(&vmafSubsampling, "vmaf-subsampling", 1, "calculate every X frame for faster comparisons")
+	pflag.BoolVar(&compareChromaNeg, "no-compare-chroma", false, "disable chroma channels in VMAF scoring")
+	pflag.IntVar(&chromaWeight, "chroma-weight", 4, "relative weight of chroma to luma channels (1/chroma-weight)")
+	pflag.BoolVar(&vmafMotion, "vmaf-motion", false, "enable temporal VMAF scoring (not recommended for high-quality targets)")
 	pflag.CommandLine.SortFlags = false
 	pflag.Parse()
 
-	if compareChromaNeg {
-		compareChroma = false
-	} else {
-		compareChroma = true
-	}
+	compareChroma = !compareChromaNeg
 }
 
 func main() {
-	var logFiles []string
-
-	if compareChroma {
-		lumaLog, err := os.CreateTemp("", "")
-		if err != nil {
-			fmt.Println(err)
-			os.Exit(2)
-		}
-		defer lumaLog.Close()
-		defer os.Remove(lumaLog.Name())
-		logFiles = append(logFiles, ConvertToUnixPath(lumaLog.Name()))
-		ULog, err := os.CreateTemp("", "")
-		if err != nil {
-			fmt.Println(err)
-			os.Exit(2)
-		}
-		defer ULog.Close()
-		defer os.Remove(ULog.Name())
-		logFiles = append(logFiles, ConvertToUnixPath(ULog.Name()))
-		VLog, err := os.CreateTemp("", "")
-		if err != nil {
-			fmt.Println(err)
-			os.Exit(2)
-		}
-		defer VLog.Close()
-		defer os.Remove(VLog.Name())
-		logFiles = append(logFiles, ConvertToUnixPath(VLog.Name()))
-	} else {
-		lumaLog, err := os.CreateTemp("", "")
-		if err != nil {
-			fmt.Println(err)
-			os.Exit(2)
-		}
-		defer lumaLog.Close()
-		logFiles = append(logFiles, ConvertToUnixPath(lumaLog.Name()))
+	vmaf := ComputeVmaf{
+		ReferencePath:   reference,
+		DistortionPath:  distortion,
+		CompareChroma:   compareChroma,
+		VmafSubsampling: vmafSubsampling,
+		ChromaWeight:    chromaWeight,
 	}
-
-	var vmafModelParam strings.Builder
-
-	vmafModelParam.WriteString("n_threads=")
-
-	if compareChroma {
-		vmafModelParam.WriteString(strconv.Itoa(runtime.NumCPU()/3 + 2))
-	} else {
-		vmafModelParam.WriteString(strconv.Itoa(runtime.NumCPU()))
-	}
-
-	vmafModelParam.WriteString(":model=version=vmaf_v0.6.1")
-
-	if !vmafMotion {
-		vmafModelParam.WriteString("\\\\:motion.motion_force_zero=true")
-	}
-
-	vmafModelParam.WriteString(":log_fmt=json")
-
-	vmafModelParamString := vmafModelParam.String()
-
-	var filter strings.Builder
-
-	filter.WriteString("[0:v:0]scale=1920:1080,format=yuv420p[dis];")
-	filter.WriteString("[1:v:0]scale=1920:1080,format=yuv420p[ref];")
-
-	if compareChroma {
-		filter.WriteString("[dis]extractplanes=y+u+v[dis_y][dis_u][dis_v];")
-		filter.WriteString("[ref]extractplanes=y+u+v[ref_y][ref_u][ref_v];")
-		filter.WriteString("[dis_u]scale=1920:1080[dis_u];")
-		filter.WriteString("[dis_v]scale=1920:1080[dis_v];")
-		filter.WriteString("[ref_u]scale=1920:1080[ref_u];")
-		filter.WriteString("[ref_v]scale=1920:1080[ref_v];")
-		filter.WriteString("[dis_y][ref_y]libvmaf=")
-		filter.WriteString(vmafModelParamString)
-		filter.WriteString(":log_path=")
-		filter.WriteString(logFiles[0])
-		filter.WriteString(";")
-		filter.WriteString("[dis_u][ref_u]libvmaf=")
-		filter.WriteString(vmafModelParamString)
-		filter.WriteString(":log_path=")
-		filter.WriteString(logFiles[1])
-		filter.WriteString(";")
-		filter.WriteString("[dis_v][ref_v]libvmaf=")
-		filter.WriteString(vmafModelParamString)
-		filter.WriteString(":log_path=")
-		filter.WriteString(logFiles[2])
-		filter.WriteString(";")
-	} else {
-		filter.WriteString("[dis][ref]libvmaf=")
-		filter.WriteString(vmafModelParamString)
-		filter.WriteString(":log_path=")
-		filter.WriteString(logFiles[0])
-	}
-
-	ffmpegCmd := exec.Command("ffmpeg",
-		"-r", "1", "-i", distortion,
-		"-r", "1", "-i", reference,
-		"-filter_complex", filter.String(),
-		"-f", "null", "null",
-	)
-
-	//fmt.Println(ffmpegCmd.Args)
-
-	//ffmpegCmd.Stderr = os.Stderr
-
-	err := ffmpegCmd.Run()
+	scores, err := vmaf.Run()
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(2)
 	}
+	PrettyPrintVmafScoreResult(scores)
 
-	var scores [][]float64 = make([][]float64, len(logFiles))
-
-	for i, file := range logFiles {
-		var err error
-		scores[i], err = parseVmafLogFile(file)
-		if err != nil {
-			fmt.Println(err)
-			os.Exit(2)
-		}
-	}
-
-	var geoScores []float64
-
-	if compareChroma {
-		for i, score := range scores {
-			switch i {
-			case 0:
-				fmt.Println("y Vmaf:")
-			case 1:
-				fmt.Println("U Vmaf")
-			case 2:
-				fmt.Println("v Vmaf:")
-			}
-			_, geomean, _, _ := CalculateStats(score)
-			geoScores = append(geoScores, geomean)
-			fmt.Println("")
-		}
-	} else {
-		fmt.Println("Vmaf:")
-		_, geomean, _, _ := CalculateStats(scores[0])
-		geoScores = append(geoScores, geomean)
-		fmt.Println("")
-	}
-	var finalScore float64
-
-	if len(geoScores) > 1 {
-		finalScore = (geoScores[0]*float64(chromaWeight) + geoScores[1] + geoScores[2]) / (float64(chromaWeight) + 2)
-	} else {
-		finalScore = geoScores[0]
-	}
-
-	fmt.Printf("Final Score: %f", finalScore)
 }
 
-func parseVmafLogFile(logFile string) ([]float64, error) {
-	var log struct {
-		Frames []struct {
-			Metrics struct {
-				Vmaf float64 `json:"vmaf"`
-			} `json:"metrics"`
-		} `json:"frames"`
-	}
-
-	logData, err := os.ReadFile(logFile)
-	if err != nil {
-		return nil, fmt.Errorf("error reading VMAF log file: %w", err)
-	}
-
-	if err := json.Unmarshal(logData, &log); err != nil {
-		return nil, fmt.Errorf("error parsing VMAF log file: %w", err)
-	}
-
-	scores := make([]float64, len(log.Frames))
-	for i, frame := range log.Frames {
-		scores[i] = frame.Metrics.Vmaf
-	}
-
-	return scores, nil
-}
-
-func ConvertToUnixPath(winPath string) string {
-	return strings.Split(strings.ReplaceAll(winPath, "\\", "/"), ":")[1]
-}
-
-func CalculateStats(numbers []float64) (float64, float64, float64, float64) {
-	if len(numbers) == 0 {
-		fmt.Println("Slice is empty. Cannot calculate statistics.")
-		return 0, 0, 0, 0
-	}
-
-	var sum, logSum float64 = 0, 0
-	min, max := numbers[0], numbers[0]
-
-	for _, num := range numbers {
-		sum += num
-		logSum += math.Log(num)
-		if num < min {
-			min = num
-		}
-		if num > max {
-			max = num
-		}
-	}
-
-	mean := sum / float64(len(numbers))
-	geomMean := math.Exp(logSum / float64(len(numbers)))
-
-	var varianceSum float64
-	for _, num := range numbers {
-		diff := num - mean
-		varianceSum += diff * diff
-	}
-	variance := varianceSum / float64(len(numbers))
-
-	stdDev := math.Sqrt(variance)
-	fmt.Printf("Mean: %.2f, Geometric Mean: %.2f, Min: %.2f, Max: %.2f, StdDev: %.2f\n", mean, geomMean, min, max, stdDev)
-
-	return mean, geomMean, min, max
+func PrettyPrintVmafScoreResult(result VmafScoreResult) {
+	fmt.Printf("VMAF Score Result:\n")
+	fmt.Printf("  Final Score: %5.2f\n", result.FinalScore)
+	fmt.Printf("                 Y      U      V\n")
+	fmt.Printf("  Mean:      [%5.2f, %5.2f, %5.2f]\n", result.Mean[0], result.Mean[1], result.Mean[2])
+	fmt.Printf("  GeoMean:   [%5.2f, %5.2f, %5.2f]\n", result.GeoMean[0], result.GeoMean[1], result.GeoMean[2])
+	fmt.Printf("  Min:       [%5.2f, %5.2f, %5.2f]\n", result.Min[0], result.Min[1], result.Min[2])
+	fmt.Printf("  Max:       [%5.2f, %5.2f, %5.2f]\n", result.Max[0], result.Max[1], result.Max[2])
+	fmt.Printf("  StdDev:    [%5.2f, %5.2f, %5.2f]\n", result.StdDev[0], result.StdDev[1], result.StdDev[2])
 }
